@@ -95,18 +95,6 @@ class Mlp(nn.Module):
     def forward(self,x):
         return self.dropout(self.proj(self.act(self.fc(x))))
     
-class Block(nn.Module):
-    def __init__(self, d_model, nhead, drop, maxlen):
-        super().__init__()
-        self.ln_1 = nn.LayerNorm(d_model)
-        self.attn = CausalSelfAttention(d_model=d_model, nhead=nhead, drop=drop, maxlen=maxlen)
-        self.ln_2 = nn.LayerNorm(d_model)
-        self.mlp = Mlp(d_model=d_model,drop=drop)
-
-    def forward(self, x , mask=None):
-        x = x + self.attn(self.ln_1(x), mask)
-        x = x + self.mlp(self.ln_2(x) )
-        return x
     
 class CLIP(nn.Module):
     def __init__(self,n,d_model):
@@ -114,70 +102,58 @@ class CLIP(nn.Module):
         self.n = n
         self.k = nn.Linear(d_model,d_model)
         self.q = nn.Embedding(n,d_model)
+        self.v = nn.Linear( n,d_model )
     def forward(self,x):
+
         k = self.k(x)
         q = self.q.weight.T[None]
         att = k @ q * (1.0 / math.sqrt(k.size(-1)))
         att = F.softmax(att, dim=-1)
-        #print(att.shape)
-        return att
+        v = self.v(att)
+        return v
 
-class GPT_block1(nn.Module):
+class Block(nn.Module):
+    def __init__(self, d_model, nhead, drop, maxlen):
+        super().__init__()
+        self.ln_1 = nn.LayerNorm(d_model)
+        self.attn = CausalSelfAttention(d_model=d_model, nhead=nhead, drop=drop, maxlen=maxlen)
+        self.ln_2 = nn.LayerNorm(d_model)
+        self.mlp = Mlp(d_model=d_model,drop=drop)
+        self.ln_3 = nn.LayerNorm(d_model)
+        self.clip = CLIP( 16 , d_model )
+    def forward(self, x , mask=None):
+        x = x + self.attn(self.ln_1(x), mask)
+        x = x + self.mlp(self.ln_2(x) )
+        x = x + self.clip(self.ln_3(x))
+        return x
+class GPT_block(nn.Module):
     def __init__(self, args):
         super().__init__()
         self.drop = nn.Dropout(args.drop)
-        self.h1 = nn.ModuleList([Block(d_model=args.dmodel, nhead=args.head, drop=args.drop, maxlen=args.maxlen) for _ in range(args.num_layer)])
+        self.h = nn.ModuleList([Block(d_model=args.dmodel, nhead=args.head, drop=args.drop, maxlen=args.maxlen) for _ in range(args.num_layer)])
         self.ln = nn.LayerNorm(args.dmodel)
-        self.clips = nn.ModuleList( [CLIP(n=num , d_model=args.dmodel) for num in args.numbers])
-        self.clip_fc = nn.Linear( sum(args.numbers)  ,args.dmodel )
+        self.lm_head = nn.Linear(args.dmodel,args.vocab)
     def forward(self,x):
         x = self.drop(x)
-        for block in self.h1:
+        for block in self.h:
             x = block(x)
         x = self.ln(x)
-        clips = [clip(x) for clip in self.clips ]
-        clip = torch.concatenate( clips , dim=-1 )
-        clip_fc = self.clip_fc(clip)
-        return clip_fc
-class GPT_block2(nn.Module):
-    def __init__(self, args):
-        super().__init__()
-        self.drop2 = nn.Dropout(args.drop)
-        self.h2 = nn.ModuleList([Block(d_model=args.dmodel, nhead=args.head, drop=args.drop, maxlen=args.maxlen) for _ in range(args.num_layer)])
-        self.ln_f = nn.LayerNorm(args.dmodel)
-        self.lm_head = nn.Linear(args.dmodel, args.vocab, bias=True)
-        self.clips = nn.ModuleList( [CLIP(n=num , d_model=args.dmodel) for num in args.numbers])
-    def forward(self,x):
-        x = self.drop2(x)
-        for block in self.h2:
-            x = block(x)
-        x = self.ln_f(x)
         logits = self.lm_head(x)
         return logits
 class GPT(nn.Module):
     def __init__(self, args):
         super().__init__()
         self.token_embedding = Embedding(d_model=args.dmodel, vocab_size=args.vocab)
+        self.clip_emb = nn.ModuleList( [ Embedding(d_model=args.dmodel, vocab_size=16) for _ in range(4)])
         self.position_embedding = PositionEmbedding(d_model=args.dmodel,numbers=args.numbers)
-        self.segment_embedding = SegmentEmbedding(d_model=args.dmodel,numbers=args.numbers,split = args.split)
-        self.block1 = GPT_block1(args=args)
-        self.block2 = GPT_block2(args=args)
-        self.step = args.step
-
-        #self.pe = args.pe
-    def forward(self, x,mask ):
-        if self.step == "first":
-            B,T = x.shape
-            emb = self.token_embedding(x)
-            pe = self.position_embedding.generate( batch_size=B , maxlen= T )
-            seg_emb = self.segment_embedding(x)
-
-            x = emb + pe + seg_emb
-            clip_fc = self.block1(x)
-            clip_fc[mask] = 0
-            x = emb + pe + seg_emb + clip_fc
-            logits = self.block2(x)
-            return logits
+        self.block = GPT_block(args=args)
+    def forward(self, x ):
+        B,T = x.shape
+        emb = self.token_embedding(x)
+        pe = self.position_embedding.generate( batch_size=B , maxlen= T )
+        x = emb + pe 
+        logits = self.block(x)
+        return logits
         
     def generate(self, idx, start):
         b, t = idx.size()
@@ -190,7 +166,7 @@ class GPT(nn.Module):
                 break
             tmp_start[idx_new[torch.arange(b), tmp_start] != 2] += 1
         return idx
-
+"""
 class GPT_block3(nn.Module):
     def __init__(self, args):
         super().__init__()
@@ -239,4 +215,4 @@ class reGPT(nn.Module):
                 x[ :,1: ] = x[ :,1: ] + clip_fc[: , :-1 ]
 
                 logits.append( self.gpt.block2(emb + clip_fc) )
-            return logits
+            return logits"""
